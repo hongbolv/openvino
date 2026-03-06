@@ -334,6 +334,8 @@ condVar.wait(lock, [&] {
 3. **最佳实践**：展示推荐的代码模式和错误处理方式；
 4. **集成测试**：作为 CI 管线的一部分，验证 API 的端到端可用性。
 
+> **注：** 仓库中未包含独立的 Real-ESRGAN 示例目录。本报告在第 3.3 节以 Real-ESRGAN 超分辨率推理为场景，基于 OpenVINO C++ API 构建完整的调用链路分析（示例代码为演示性质），展示超分辨率任务与分类任务在 API 使用上的异同。
+
 ### 3.2 文件结构与功能说明
 
 ```
@@ -375,8 +377,6 @@ samples/cpp/
     └── ...                                 # 包含完整的性能测量框架
 ```
 
-> **注：** 仓库中未包含独立的 Real-ESRGAN 示例目录。本报告在第 3.3 节以 Real-ESRGAN 超分辨率推理为场景，基于 OpenVINO C++ API 构建完整的调用链路分析，展示超分辨率任务与分类任务在 API 使用上的异同。
-
 各示例功能对比：
 
 | 示例名称 | 核心功能 | 推理模式 | 输入格式 | 预处理 | 代码行数 |
@@ -408,6 +408,7 @@ samples/cpp/
 ```cpp
 // real_esrgan_inference.cpp — Real-ESRGAN 超分辨率推理示例
 // 基于 OpenVINO C++ Runtime API
+// 注：此为演示代码，展示 API 调用流程。实际项目中图像读写建议使用 OpenCV。
 
 #include <algorithm>
 #include <fstream>
@@ -416,15 +417,10 @@ samples/cpp/
 #include <string>
 #include <vector>
 
-#include "openvino/openvino.hpp"
+#include "openvino/openvino.hpp"  // 包含 Core, Tensor, PrePostProcessor, OPENVINO_ASSERT 等全部 API
 
-// 简化的 BMP 图像读写（实际项目中建议使用 OpenCV 或 stb_image）
-struct Image {
-    std::vector<uint8_t> data;  // RGB 像素数据，NHWC 布局
-    size_t width;
-    size_t height;
-    size_t channels = 3;
-};
+// 使用 OpenCV 进行图像读写（实际项目依赖）
+#include <opencv2/opencv.hpp>
 
 int main(int argc, char* argv[]) {
     try {
@@ -460,12 +456,16 @@ int main(int argc, char* argv[]) {
         std::cout << "Model output shape: " << output_shape << std::endl;
 
         // -------- Step 3. 读取输入图像 --------
-        // 实际项目中使用 OpenCV 的 cv::imread()，此处简化为假设已有像素数据
-        Image input_image;  // 假设已填充 RGB u8 数据
-        input_image.width = input_shape[3];   // W
-        input_image.height = input_shape[2];  // H
-        input_image.channels = 3;
-        // input_image.data = read_image_file(image_path, width, height);
+        // 使用 OpenCV 加载图像为 RGB uint8 格式
+        cv::Mat bgr_image = cv::imread(image_path, cv::IMREAD_COLOR);
+        if (bgr_image.empty()) {
+            throw std::logic_error("Failed to read image: " + image_path);
+        }
+        cv::Mat rgb_image;
+        cv::cvtColor(bgr_image, rgb_image, cv::COLOR_BGR2RGB);  // OpenCV 默认 BGR → RGB
+
+        size_t img_h = static_cast<size_t>(rgb_image.rows);
+        size_t img_w = static_cast<size_t>(rgb_image.cols);
 
         // -------- Step 4. 配置预处理 --------
         // Real-ESRGAN 输入要求：float32, NCHW 布局, [0,1] 归一化
@@ -499,10 +499,10 @@ int main(int argc, char* argv[]) {
         ov::InferRequest infer_request = compiled_model.create_infer_request();
 
         // -------- Step 7. 准备输入张量 --------
-        // 使用零拷贝方式包装图像内存
+        // 使用零拷贝方式包装 OpenCV Mat 内存（rgb_image 必须在推理期间保持有效）
         ov::Tensor input_tensor(ov::element::u8,
-                                {1, input_image.height, input_image.width, 3},
-                                input_image.data.data());
+                                {1, img_h, img_w, 3},
+                                rgb_image.data);
         infer_request.set_input_tensor(input_tensor);
 
         // -------- Step 8. 执行同步推理 --------
@@ -533,9 +533,16 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 保存高分辨率图像（实际项目中使用 cv::imwrite）
-        std::cout << "Super-resolution complete. Output: "
-                  << out_w << "x" << out_h << " pixels." << std::endl;
+        // 保存高分辨率图像
+        // 注意：output_image 为 RGB 排列，OpenCV 需要 BGR 格式
+        cv::Mat out_mat(static_cast<int>(out_h), static_cast<int>(out_w),
+                        CV_8UC3, output_image.data());
+        cv::Mat bgr_output;
+        cv::cvtColor(out_mat, bgr_output, cv::COLOR_RGB2BGR);
+        cv::imwrite("output_sr.png", bgr_output);
+
+        std::cout << "Super-resolution complete. Output saved: output_sr.png ("
+                  << out_w << "x" << out_h << " pixels)." << std::endl;
 
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
@@ -1117,15 +1124,15 @@ float* data = tensor.data<float>();                       // 获取内部指针
 
 ```cpp
 // Real-ESRGAN 推理示例中的零拷贝张量创建
-// 直接包装已有图像内存，不分配新缓冲区
+// 直接包装 OpenCV Mat 内存，不分配新缓冲区
 ov::Tensor input_tensor(ov::element::u8,
-                        {1, input_image.height, input_image.width, 3},
-                        input_image.data.data());
+                        {1, img_h, img_w, 3},
+                        rgb_image.data);
 ```
 
-零拷贝设计的核心价值：在图像处理场景中，图像数据通常由外部库（如 OpenCV、自定义读取器）分配并填充。如果推理引擎需要再拷贝一份到自己的缓冲区，会浪费内存带宽，尤其在 Real-ESRGAN 等超分辨率场景下处理高分辨率图像时影响显著。
+零拷贝设计的核心价值：在图像处理场景中，图像数据通常由外部库（如 OpenCV）分配并填充。如果推理引擎需要再拷贝一份到自己的缓冲区，会浪费内存带宽，尤其在 Real-ESRGAN 等超分辨率场景下处理高分辨率图像时影响显著。
 
-**生命周期管理要点：** 使用零拷贝模式时，用户必须确保外部内存在 `InferRequest::infer()` 或 `start_async()` 完成之前保持有效。在 Real-ESRGAN 示例中，`input_image.data`（`std::vector<uint8_t>`）的生命周期覆盖了整个 `try` 块，因此安全。
+**生命周期管理要点：** 使用零拷贝模式时，用户必须确保外部内存在 `InferRequest::infer()` 或 `start_async()` 完成之前保持有效。在 Real-ESRGAN 示例中，`rgb_image`（`cv::Mat`）的生命周期覆盖了整个 `try` 块，因此安全。
 
 ### 4.2 异步推理与多线程
 
