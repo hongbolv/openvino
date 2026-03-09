@@ -13,16 +13,10 @@
   - [2.3 预处理管线](#23-预处理管线)
   - [2.4 模型编译与设备适配](#24-模型编译与设备适配)
   - [2.5 推理执行与结果获取](#25-推理执行与结果获取)
-- [3. Inference C++ Example 专项分析](#3-inference-c-example-专项分析)
-  - [3.1 示例模块定位与作用](#31-示例模块定位与作用)
-  - [3.2 文件结构与功能说明](#32-文件结构与功能说明)
-  - [3.3 Real-ESRGAN 超分辨率推理完整调用链路](#33-real-esrgan-超分辨率推理完整调用链路)
-  - [3.4 classification_sample_async 异步推理链路](#34-classification_sample_async-异步推理链路)
-  - [3.5 hello_query_device 设备查询链路](#35-hello_query_device-设备查询链路)
-  - [3.6 hello_reshape_ssd 目标检测链路](#36-hello_reshape_ssd-目标检测链路)
-  - [3.7 hello_nv12_input_classification NV12 输入链路](#37-hello_nv12_input_classification-nv12-输入链路)
-  - [3.8 model_creation_sample 动态建模链路](#38-model_creation_sample-动态建模链路)
-  - [3.9 调用关系可视化](#39-调用关系可视化)
+- [3. Real-ESRGAN 超分辨率推理专项分析](#3-real-esrgan-超分辨率推理专项分析)
+  - [3.1 分析背景与目标](#31-分析背景与目标)
+  - [3.2 Real-ESRGAN 超分辨率推理完整调用链路](#32-real-esrgan-超分辨率推理完整调用链路)
+  - [3.3 调用关系可视化](#33-调用关系可视化)
 - [4. 关键技术细节](#4-关键技术细节)
   - [4.1 内存管理与零拷贝设计](#41-内存管理与零拷贝设计)
   - [4.2 异步推理与多线程](#42-异步推理与多线程)
@@ -34,7 +28,7 @@
   - [5.1 项目设计优势](#51-项目设计优势)
   - [5.2 项目设计不足](#52-项目设计不足)
   - [5.3 核心逻辑可优化点](#53-核心逻辑可优化点)
-  - [5.4 Inference C++ Example 调用设计思路](#54-inference-c-example-调用设计思路)
+  - [5.4 Real-ESRGAN 推理调用设计思路](#54-real-esrgan-推理调用设计思路)
 
 ---
 
@@ -290,8 +284,10 @@ void InferRequest::set_tensor(const std::string& name, const Tensor& tensor) {
 
 **异步推理（回调模式）：**
 
+OpenVINO 支持异步推理模式，在 Real-ESRGAN 等高计算量场景中尤为有价值。异步模式允许 CPU 在等待设备计算的同时准备下一批数据：
+
 ```cpp
-// 文件: samples/cpp/classification_sample_async/main.cpp, 第 164-197 行
+// 异步推理示例（可应用于 Real-ESRGAN 分块推理场景）
 
 // 设置异步回调
 infer_request.set_callback([&](std::exception_ptr ex) {
@@ -301,21 +297,17 @@ infer_request.set_callback([&](std::exception_ptr ex) {
         condVar.notify_all();
         return;
     }
-    cur_iteration++;
-    if (cur_iteration < num_iterations) {
-        infer_request.start_async();  // 继续下一轮异步推理
-    } else {
-        condVar.notify_one();         // 所有迭代完成，通知主线程
-    }
+    // 处理当前 tile 的输出，准备下一个 tile
+    condVar.notify_one();
 });
 
-infer_request.start_async();  // 启动第一次异步推理
+infer_request.start_async();  // 启动异步推理
 
 // 主线程等待
 std::unique_lock<std::mutex> lock(mutex);
 condVar.wait(lock, [&] {
     if (exception_var) std::rethrow_exception(exception_var);
-    return cur_iteration == num_iterations;
+    return finished;
 });
 ```
 
@@ -323,77 +315,17 @@ condVar.wait(lock, [&] {
 
 ---
 
-## 3. Inference C++ Example 专项分析
+## 3. Real-ESRGAN 超分辨率推理专项分析
 
-### 3.1 示例模块定位与作用
+### 3.1 分析背景与目标
 
-`samples/cpp/` 目录是 OpenVINO 官方提供的 C++ 推理示例集合，定位为：
+本章以 Real-ESRGAN（Real-Enhanced Super-Resolution Generative Adversarial Network）为例，展示如何使用 OpenVINO C++ API 实现图像超分辨率推理的完整调用链路分析。Real-ESRGAN 是一种面向真实世界图像退化场景的超分辨率模型，能够将低分辨率图像放大 4 倍（或 2 倍），同时恢复纹理细节并抑制伪影。
 
-1. **入门教程**：为开发者提供从零开始使用 OpenVINO C++ API 的完整示例；
-2. **API 演示**：每个示例聚焦于一个特定功能点（同步推理、异步推理、设备查询、模型动态 reshape、特殊输入格式、编程式建模）；
-3. **最佳实践**：展示推荐的代码模式和错误处理方式；
-4. **集成测试**：作为 CI 管线的一部分，验证 API 的端到端可用性。
+> **注：** OpenVINO 仓库 `samples/cpp/` 目录中未包含独立的 Real-ESRGAN 示例。本章基于 OpenVINO C++ API 构建完整的 Real-ESRGAN 推理代码（示例代码为演示性质），聚焦于超分辨率任务对推理管线各阶段（模型加载、预处理、编译、推理、后处理）的具体使用方式。
 
-> **注：** 仓库中未包含独立的 Real-ESRGAN 示例目录。本报告在第 3.3 节以 Real-ESRGAN 超分辨率推理为场景，基于 OpenVINO C++ API 构建完整的调用链路分析（示例代码为演示性质），展示超分辨率任务与分类任务在 API 使用上的异同。
+### 3.2 Real-ESRGAN 超分辨率推理完整调用链路
 
-### 3.2 文件结构与功能说明
-
-```
-samples/cpp/
-├── CMakeLists.txt                          # 顶层构建文件，定义 ov_add_sample() 宏
-├── build_samples.sh / .ps1 / .bat          # 独立构建脚本
-├── common/                                 # 公共工具库
-│   ├── CMakeLists.txt                      # 构建配置
-│   ├── format_reader/                      # 图像读取器（BMP/PNG/JPEG 格式支持）
-│   └── utils/                              # 通用工具
-│       └── include/samples/
-│           ├── args_helper.hpp             # 输入文件路径解析、精度配置
-│           ├── common.hpp                  # 字符串工具、Unicode、性能计数排序
-│           ├── classification_results.h    # 分类结果格式化输出
-│           ├── slog.hpp                    # 结构化日志输出
-│           ├── csv_dumper.hpp              # CSV 报告生成
-│           └── latency_metrics.hpp         # 延迟指标统计
-├── hello_classification/                   # 同步图像分类（最简推理流程）
-│   ├── CMakeLists.txt
-│   └── main.cpp                            # 127 行
-├── classification_sample_async/            # 异步图像分类（回调+批处理）
-│   ├── CMakeLists.txt
-│   ├── classification_sample_async.h       # gflags 参数定义
-│   └── main.cpp                            # 232 行
-├── hello_query_device/                     # 设备信息查询
-│   ├── CMakeLists.txt
-│   └── main.cpp                            # 75 行
-├── hello_reshape_ssd/                      # SSD 目标检测 + 动态 reshape
-│   ├── CMakeLists.txt
-│   └── main.cpp                            # 212 行
-├── hello_nv12_input_classification/        # NV12 色彩格式输入分类
-│   ├── CMakeLists.txt
-│   └── main.cpp                            # 188 行
-├── model_creation_sample/                  # 编程式构建 LeNet 模型
-│   ├── CMakeLists.txt
-│   ├── model_creation_sample.hpp           # 手写数字数据定义
-│   └── main.cpp                            # 326 行
-└── benchmark_app/                          # 性能基准测试工具
-    └── ...                                 # 包含完整的性能测量框架
-```
-
-各示例功能对比：
-
-| 示例名称 | 核心功能 | 推理模式 | 输入格式 | 预处理 | 代码行数 |
-|----------|---------|---------|---------|--------|---------|
-| **Real-ESRGAN 推理（自定义）** | **图像超分辨率** | **同步** | **图像文件** | **u8→f32 + layout + scale** | **~100** |
-| hello_classification | 基础图像分类 | 同步 | 图像文件 | resize + layout 转换 | 127 |
-| classification_sample_async | 多图批量分类 | 异步(回调) | 多图像文件 | u8→f32 + layout 转换 | 232 |
-| hello_query_device | 设备属性枚举 | 无推理 | 无 | 无 | 75 |
-| hello_reshape_ssd | SSD 目标检测 | 同步 | 图像文件 | u8→f32 + layout + resize | 212 |
-| hello_nv12_input_classification | NV12 格式分类 | 同步 | NV12 原始数据 | NV12→BGR + resize | 188 |
-| model_creation_sample | 动态建模+推理 | 同步 | 内置数据 | u8→f32 + layout 转换 | 326 |
-
-### 3.3 Real-ESRGAN 超分辨率推理完整调用链路
-
-本节以 Real-ESRGAN（Real-Enhanced Super-Resolution Generative Adversarial Network）为例，展示如何使用 OpenVINO C++ API 实现图像超分辨率推理。Real-ESRGAN 是一种面向真实世界图像退化场景的超分辨率模型，能够将低分辨率图像放大 4 倍（或 2 倍），同时恢复纹理细节并抑制伪影。
-
-#### 3.3.1 Real-ESRGAN 模型特征
+#### 3.2.1 Real-ESRGAN 模型特征
 
 | 属性 | 说明 |
 |------|------|
@@ -403,7 +335,7 @@ samples/cpp/
 | 核心结构 | RRDB（Residual-in-Residual Dense Block）+ 上采样（PixelShuffle） |
 | 典型参数量 | ~16.7M（x4plus 版本） |
 
-#### 3.3.2 完整 C++ 推理代码
+#### 3.2.2 完整 C++ 推理代码
 
 ```cpp
 // real_esrgan_inference.cpp — Real-ESRGAN 超分辨率推理示例
@@ -553,7 +485,7 @@ int main(int argc, char* argv[]) {
 }
 ```
 
-#### 3.3.3 完整调用链路（函数级）
+#### 3.2.3 完整调用链路（函数级）
 
 | 步骤 | 调用函数 | 输入 | 输出 | 依赖 |
 |------|---------|------|------|------|
@@ -576,19 +508,19 @@ int main(int argc, char* argv[]) {
 | 17 | `output_tensor.data<float>()` | 无 | `float*`（NCHW [0,1]） | ov::Tensor |
 | 18 | 后处理循环：`clamp(val * 255)`, NCHW→NHWC | float 数据 | `vector<uint8_t>` 图像 | 用户代码 |
 
-#### 3.3.4 与分类示例（hello_classification）的关键差异
+#### 3.2.4 超分辨率推理与分类推理的关键差异
 
-| 维度 | hello_classification | Real-ESRGAN 推理 |
+| 维度 | 分类推理（如 ResNet） | Real-ESRGAN 超分辨率推理 |
 |------|---------------------|------------------|
 | 任务类型 | 图像分类（输出类别标签） | 图像超分辨率（输出高分辨率图像） |
-| 预处理 resize | 需要 resize 到模型输入尺寸 | **不 resize**（保持原始分辨率） |
+| 预处理 resize | 需要 resize 到模型固定输入尺寸 | **不 resize**（保持原始分辨率） |
 | 归一化方式 | 隐式（由模型内部处理） | 显式 `scale(255.0f)` 到 [0,1] |
 | 输出处理 | 取 argmax 得分类索引 | 反归一化 + NCHW→NHWC 布局转换 + 保存图像 |
 | 输出张量形状 | `{1, num_classes}` | `{1, 3, H*4, W*4}`（与输入同类型） |
-| 依赖外部库 | format_reader（BMP/PNG 读取） | 推荐 OpenCV（cv::imread/imwrite） |
+| 依赖外部库 | 内置 format_reader 即可 | 推荐 OpenCV（cv::imread/imwrite） |
 | 计算量 | 轻量（ResNet ~25M params） | 重量（Real-ESRGAN ~16.7M params, 大量逐像素计算） |
 
-#### 3.3.5 Real-ESRGAN 推理关键技术要点
+#### 3.2.5 Real-ESRGAN 推理关键技术要点
 
 **1. ONNX 模型加载**
 
@@ -636,322 +568,10 @@ Real-ESRGAN 对显存/内存需求敏感。对于大尺寸输入图像（如 192
 
 **异常处理：** 整个流程包裹在 `try-catch` 块中，捕获 `std::exception` 并输出到 `std::cerr`，返回 `EXIT_FAILURE`。常见异常场景包括：模型格式不兼容（ONNX opset 版本过新）、设备不可用、内存不足（大尺寸图像）等。
 
-### 3.4 classification_sample_async 异步推理链路
 
-**入口函数：** `main(int argc, char* argv[])` — 标准 C++ 入口。
+### 3.3 调用关系可视化
 
-**与同步版本的关键差异：**
-
-1. **命令行解析**：使用 gflags 库替代手动参数解析：
-
-```cpp
-// 文件: samples/cpp/classification_sample_async/main.cpp, 第 36-56 行
-bool parse_and_check_command_line(int argc, char* argv[]) {
-    gflags::ParseCommandLineNonHelpFlags(&argc, &argv, true);
-    if (FLAGS_h) { show_usage(); showAvailableDevices(); return false; }
-    if (FLAGS_m.empty()) throw std::logic_error("Model is required but not set.");
-    if (FLAGS_i.empty()) throw std::logic_error("Input is required but not set.");
-    return true;
-}
-```
-
-2. **动态批处理**：根据输入图像数量自动设置 batch size：
-
-```cpp
-// 文件: samples/cpp/classification_sample_async/main.cpp, 第 133-137 行
-const size_t batchSize = images_data.size();
-ov::set_batch(model, batchSize);  // 动态修改模型的 batch 维度
-```
-
-3. **异步推理核心**：回调函数 + 条件变量组合：
-
-```cpp
-// 文件: samples/cpp/classification_sample_async/main.cpp, 第 158-197 行
-size_t num_iterations = 10;
-size_t cur_iteration = 0;
-std::condition_variable condVar;
-std::mutex mutex;
-std::exception_ptr exception_var;
-
-// 回调函数：在推理完成时由推理引擎在其工作线程中调用
-infer_request.set_callback([&](std::exception_ptr ex) {
-    std::lock_guard<std::mutex> l(mutex);    // 保护共享状态
-    if (ex) {                                 // 异常传播
-        exception_var = ex;
-        condVar.notify_all();
-        return;
-    }
-    cur_iteration++;
-    if (cur_iteration < num_iterations) {
-        infer_request.start_async();          // 链式启动下一次推理
-    } else {
-        condVar.notify_one();                 // 通知主线程完成
-    }
-});
-
-infer_request.start_async();                  // 启动首次异步推理
-
-// 主线程阻塞等待
-std::unique_lock<std::mutex> lock(mutex);
-condVar.wait(lock, [&] {
-    if (exception_var) std::rethrow_exception(exception_var);
-    return cur_iteration == num_iterations;
-});
-```
-
-**关键设计细节：**
-
-- **线程安全**：回调函数中使用 `std::lock_guard<std::mutex>` 保护 `cur_iteration` 和 `exception_var` 共享变量，因为回调在推理引擎的工作线程中执行，与主线程并发运行；
-- **异常传播**：通过 `std::exception_ptr` 将推理线程中发生的异常传递到主线程，在 `condVar.wait()` 的谓词中 `rethrow`，确保异常不会被吞没；
-- **链式异步**：在回调中直接调用 `start_async()` 启动下一轮推理，形成异步推理链，最大化设备利用率。
-
-4. **批量数据填充**：
-
-```cpp
-// 文件: samples/cpp/classification_sample_async/main.cpp, 第 148-155 行
-ov::Tensor input_tensor = infer_request.get_input_tensor();  // 获取预分配张量
-for (size_t image_id = 0; image_id < images_data.size(); ++image_id) {
-    const size_t image_size = shape_size(model->input().get_shape()) / batchSize;
-    std::memcpy(input_tensor.data<std::uint8_t>() + image_id * image_size,
-                images_data[image_id].get(), image_size);    // 逐图像拷贝到 batch 张量
-}
-```
-
-此处使用 `get_input_tensor()` 获取推理引擎内部预分配的张量缓冲区，然后通过 `std::memcpy` 将多张图像依次写入 batch 维度的对应位置。
-
-### 3.5 hello_query_device 设备查询链路
-
-**入口函数：** `main(int argc, char* argv[])`
-
-此示例不执行推理，仅查询系统可用设备及其属性。
-
-**调用链路：**
-
-```cpp
-// 文件: samples/cpp/hello_query_device/main.cpp
-
-// 1. 初始化核心
-ov::Core core;                                                    // 第 45 行
-
-// 2. 获取所有可用设备
-std::vector<std::string> availableDevices = core.get_available_devices();  // 第 48 行
-
-// 3. 遍历设备，查询属性
-for (auto&& device : availableDevices) {
-    auto supported_properties = core.get_property(device, ov::supported_properties);  // 第 57 行
-    for (auto&& property : supported_properties) {
-        if (property != ov::supported_properties.name()) {
-            // 输出属性名称、可变性（Mutable/Immutable）和属性值
-            print_any_value(core.get_property(device, property));  // 第 62 行
-        }
-    }
-}
-```
-
-**关键函数：**
-
-- `core.get_available_devices()`：扫描系统注册的所有设备插件，返回可用设备名称列表；
-- `core.get_property(device, ov::supported_properties)`：获取设备支持的所有属性列表，每个属性包含名称和可变性标记（`PropertyMutability::RO` 或 `RW`）；
-- `print_any_value()`：将 `ov::Any` 类型的属性值转换为字符串并输出。
-
-**`ov::Any` 类型**：OpenVINO 的通用值容器（类似 `std::any`），支持任意类型值的存储和类型安全的提取。通过 `value.as<std::string>()` 转换为字符串表示。
-
-### 3.6 hello_reshape_ssd 目标检测链路
-
-**入口函数：** `main(int argc, char* argv[])`
-
-此示例展示 SSD（Single Shot MultiBox Detector）目标检测的完整流程，包含模型验证、动态 reshape 和检测结果后处理。
-
-**关键独特步骤：**
-
-1. **模型验证 — DetectionOutput 层检查**：
-
-```cpp
-// 文件: samples/cpp/hello_reshape_ssd/main.cpp, 第 54-61 行
-const ov::NodeVector ops = model->get_ops();  // 获取模型中所有算子节点
-const auto it = std::find_if(ops.begin(), ops.end(), [](const std::shared_ptr<ov::Node>& node) {
-    return std::string{node->get_type_name()} ==
-           std::string{ov::opset9::DetectionOutput::get_type_info_static().name};
-});
-if (it == ops.end()) {
-    throw std::logic_error("model does not contain DetectionOutput layer");
-}
-```
-
-遍历模型的所有算子节点，查找 `DetectionOutput` 层以验证模型确实是 SSD 类型。
-
-2. **动态 Reshape**：
-
-```cpp
-// 文件: samples/cpp/hello_reshape_ssd/main.cpp, 第 79-94 行
-const ov::Layout model_layout{"NCHW"};
-ov::Shape tensor_shape = model->input().get_shape();
-
-tensor_shape[ov::layout::batch_idx(model_layout)] = batch_size;       // N
-tensor_shape[ov::layout::channels_idx(model_layout)] = image_channels; // C
-tensor_shape[ov::layout::height_idx(model_layout)] = image_height;     // H
-tensor_shape[ov::layout::width_idx(model_layout)] = image_width;       // W
-
-model->reshape({{model->input().get_any_name(), tensor_shape}});
-```
-
-使用 `ov::layout::*_idx()` 工具函数根据布局语义获取形状维度索引，然后调用 `model->reshape()` 将模型输入调整为实际图像尺寸。
-
-3. **SSD 输出解析**：
-
-```cpp
-// 文件: samples/cpp/hello_reshape_ssd/main.cpp, 第 165-190 行
-for (size_t object = 0; object < ssd_object_count; object++) {
-    // SSD 输出格式: [image_id, label, conf, x_min, y_min, x_max, y_max]
-    int image_id = static_cast<int>(detections[object * ssd_object_size + 0]);
-    if (image_id < 0) break;  // 负 image_id 表示检测结束
-
-    int label = static_cast<int>(detections[object * ssd_object_size + 1]);
-    float confidence = detections[object * ssd_object_size + 2];
-    int xmin = static_cast<int>(detections[object * ssd_object_size + 3] * image_width);
-    int ymin = static_cast<int>(detections[object * ssd_object_size + 4] * image_height);
-    int xmax = static_cast<int>(detections[object * ssd_object_size + 5] * image_width);
-    int ymax = static_cast<int>(detections[object * ssd_object_size + 6] * image_height);
-
-    if (confidence > 0.5f) {   // 置信度阈值过滤
-        boxes.push_back(xmin); boxes.push_back(ymin);
-        boxes.push_back(xmax - xmin); boxes.push_back(ymax - ymin);
-    }
-}
-```
-
-SSD 输出为二维数组，每行 7 个浮点数：图像 ID、类别标签、置信度、归一化坐标（x_min, y_min, x_max, y_max）。坐标需乘以图像尺寸还原为像素坐标。
-
-### 3.7 hello_nv12_input_classification NV12 输入链路
-
-**入口函数：** `main(int argc, char* argv[])`
-
-此示例演示处理 NV12 色彩格式输入（常见于摄像头原始帧）的分类推理。
-
-**独特技术点：**
-
-1. **图像尺寸解析**：
-
-```cpp
-// 文件: samples/cpp/hello_nv12_input_classification/main.cpp, 第 40-63 行
-std::pair<size_t, size_t> parse_image_size(const std::string& size_string) {
-    auto delimiter_pos = size_string.find("x");
-    // 解析 "WIDTHxHEIGHT" 格式
-    size_t width = static_cast<size_t>(std::stoull(size_string.substr(0, delimiter_pos)));
-    size_t height = static_cast<size_t>(std::stoull(size_string.substr(delimiter_pos + 1)));
-    // 验证：宽高不为零且为偶数（NV12 格式要求）
-    if (width % 2 != 0 || height % 2 != 0)
-        throw std::runtime_error("width and height must be even numbers");
-    return {width, height};
-}
-```
-
-NV12 格式要求图像宽高为偶数，因为色度（chroma）分量的分辨率是亮度（luma）的一半。
-
-2. **NV12 预处理管线**：
-
-```cpp
-// 文件: samples/cpp/hello_nv12_input_classification/main.cpp, 第 113-138 行
-PrePostProcessor ppp = PrePostProcessor(model);
-InputInfo& input_info = ppp.input(input_tensor_name);
-
-input_info.tensor()
-    .set_element_type(ov::element::u8)
-    .set_color_format(ColorFormat::NV12_SINGLE_PLANE)     // NV12 单平面格式
-    .set_spatial_static_shape(input_height, input_width);  // 空间维度
-
-input_info.preprocess()
-    .convert_element_type(ov::element::f32)   // u8 → f32
-    .convert_color(ColorFormat::BGR)           // NV12 → BGR
-    .resize(ResizeAlgorithm::RESIZE_LINEAR);   // 线性缩放
-
-input_info.model().set_layout("NCHW");
-model = ppp.build();
-```
-
-3. **NV12 张量构造**：
-
-```cpp
-// 文件: samples/cpp/hello_nv12_input_classification/main.cpp, 第 149 行
-ov::Tensor input_tensor{ov::element::u8, {batch, input_height * 3 / 2, input_width, 1}, image_data.get()};
-```
-
-NV12 格式的内存布局：Y 平面（`height × width`）+ UV 平面（`height/2 × width`），总高度 = `height * 3 / 2`。
-
-### 3.8 model_creation_sample 动态建模链路
-
-**入口函数：** `main(int argc, char* argv[])`
-
-此示例展示不从文件加载模型，而是通过 OpenVINO 的 opset API 编程式构建 LeNet 卷积神经网络。
-
-**模型构建核心流程（`create_model()` 函数）：**
-
-```cpp
-// 文件: samples/cpp/model_creation_sample/main.cpp, 第 78-215 行
-
-std::shared_ptr<ov::Model> create_model(const std::string& path_to_weights) {
-    const ov::Tensor weights = read_weights(path_to_weights);  // 读取权重文件
-    const std::uint8_t* data = weights.data<std::uint8_t>();   // 获取原始数据指针
-
-    // 输入节点: [64, 1, 28, 28] (batch=64, 单通道, 28x28 像素)
-    auto paramNode = std::make_shared<ov::opset13::Parameter>(
-        ov::element::Type_t::f32, ov::Shape({64, 1, 28, 28}));
-
-    // Conv1: 20 个 5x5 滤波器
-    auto convFirstShape = Shape{20, 1, 5, 5};
-    auto convolutionFirstConstantNode = std::make_shared<opset13::Constant>(
-        element::Type_t::f32, convFirstShape, data);
-    auto convolutionNodeFirst = std::make_shared<opset13::Convolution>(
-        paramNode->output(0), convolutionFirstConstantNode->output(0),
-        Strides({1, 1}), CoordinateDiff({0, 0}), CoordinateDiff({0, 0}), Strides({1, 1}));
-
-    // Add1: 偏置项
-    auto addFirstConstantNode = std::make_shared<opset13::Constant>(
-        element::Type_t::f32, Shape{1, 20, 1, 1}, data + offset);
-    auto addNodeFirst = std::make_shared<opset13::Add>(
-        convolutionNodeFirst->output(0), addFirstConstantNode->output(0));
-
-    // MaxPool1: 2x2 步长为 2
-    auto maxPoolingNodeFirst = std::make_shared<opset13::MaxPool>(
-        addNodeFirst->output(0), Strides{2, 2}, Strides{1, 1},
-        Shape{0, 0}, Shape{0, 0}, Shape{2, 2}, op::RoundingType::CEIL);
-
-    // ... Conv2 + Add2 + MaxPool2 (类似结构)
-
-    // Reshape → MatMul(500) → Add → ReLU → Reshape → MatMul(10) → Add → Softmax
-    auto softMaxNode = std::make_shared<opset13::Softmax>(add4Node->output(0), 1);
-
-    // 构建 ov::Model
-    auto result_full = std::make_shared<opset13::Result>(softMaxNode->output(0));
-    return std::make_shared<ov::Model>(result_full, ov::ParameterVector{paramNode}, "lenet");
-}
-```
-
-**权重文件管理：**
-
-```cpp
-// 文件: samples/cpp/model_creation_sample/main.cpp, 第 60-72 行
-ov::Tensor read_weights(const std::string& filepath) {
-    std::ifstream weightFile(filepath, std::ifstream::ate | std::ifstream::binary);
-    int64_t fileSize = weightFile.tellg();
-    OPENVINO_ASSERT(fileSize == LENET_WEIGHTS_SIZE,  // 验证文件大小 = 1724336 字节
-                    "Incorrect weights file.");
-    ov::Tensor weights(ov::element::u8, {static_cast<size_t>(fileSize)});
-    read_file(filepath, weights.data(), weights.get_byte_size());
-    return weights;
-}
-```
-
-权重以 `ov::Tensor` 形式存储，直接作为 `opset13::Constant` 节点的初始化数据。通过偏移量 `offset` 在连续的权重缓冲区中定位每层的权重起始位置。
-
-**设计优势：**
-
-- **算子级建模**：使用 opset13 命名空间中的标准算子（Convolution、MaxPool、MatMul 等）构建计算图，与文件加载的模型使用完全相同的内部表示；
-- **权重共享**：所有层的权重存储在一个连续缓冲区中，通过指针偏移访问，减少内存分配次数。
-
-### 3.9 调用关系可视化
-
-#### 3.9.1 核心推理流程（所有示例通用）
+#### 3.3.1 Real-ESRGAN 推理流程
 
 ```mermaid
 graph TD
@@ -959,16 +579,16 @@ graph TD
     B --> B1[CoreImpl 初始化]
     B1 --> B2[注册设备插件 plugins.xml]
 
-    A --> C[core.read_model]
+    A --> C[core.read_model<br/>加载 ONNX 模型]
     C --> C1[CoreImpl::read_model]
-    C1 --> C2[Frontend 解析器<br/>ONNX/TF/IR/...]
-    C2 --> C3[ov::Model<br/>计算图 DAG]
+    C1 --> C2[ONNX Frontend 解析器]
+    C2 --> C3[ov::Model<br/>RRDB 计算图 DAG]
 
     A --> D[PrePostProcessor]
-    D --> D1[input.tensor 配置]
-    D --> D2[input.preprocess 步骤]
-    D --> D3[input.model 布局]
-    D --> D4[output.tensor 精度]
+    D --> D1[input.tensor: u8 NHWC]
+    D --> D2[preprocess: u8→f32 + NCHW + scale÷255]
+    D --> D3[input.model: NCHW 布局]
+    D --> D4[output.tensor: f32]
     D --> D5[ppp.build<br/>插入预处理节点到图]
     D5 --> C3
 
@@ -983,21 +603,15 @@ graph TD
     F --> F1[ICompiledModel::create_infer_request]
     F1 --> F2[InferRequest]
 
-    A --> G[infer_request.set_input_tensor]
+    A --> G[set_input_tensor<br/>零拷贝包装 cv::Mat]
     G --> G1[IAsyncInferRequest::set_tensor]
 
-    A --> H{推理模式}
-    H -->|同步| I[infer_request.infer]
-    H -->|异步| J[infer_request.start_async]
-    J --> J1[set_callback 回调]
-    J1 --> J2[condVar.wait 等待]
-
-    I --> K[infer_request.get_output_tensor]
-    J2 --> K
-    K --> L[结果后处理<br/>分类 / SSD 解析 / 超分图像保存]
+    A --> I[infer_request.infer<br/>同步推理]
+    I --> K[get_output_tensor<br/>NCHW float 超分图像]
+    K --> L[后处理: 反归一化<br/>clamp + NCHW→NHWC + cv::imwrite]
 ```
 
-#### 3.9.2 类依赖关系
+#### 3.3.2 类依赖关系
 
 ```mermaid
 classDiagram
@@ -1061,50 +675,6 @@ classDiagram
     Model --> PrePostProcessor : 构造参数
 ```
 
-#### 3.9.3 各示例调用差异对比
-
-```mermaid
-graph LR
-    subgraph 共享流程
-        A[Core] --> B[read_model]
-        B --> C[PrePostProcessor]
-        C --> D[compile_model]
-        D --> E[create_infer_request]
-    end
-
-    subgraph Real-ESRGAN 超分辨率推理
-        E --> F0[set_input_tensor<br/>零拷贝 u8 图像]
-        F0 --> G0[infer 同步]
-        G0 --> H0[get_output_tensor<br/>NCHW float 超分图像]
-        H0 --> H01[后处理: 反归一化<br/>NCHW→NHWC + 保存]
-    end
-
-    subgraph classification_sample_async
-        E --> F2[get_input_tensor<br/>+ memcpy 批量]
-        F2 --> G2[set_callback]
-        G2 --> G3[start_async]
-        G3 --> H2[condVar.wait]
-    end
-
-    subgraph hello_reshape_ssd
-        B --> B2[model->reshape<br/>适配图像尺寸]
-        B2 --> C
-        E --> F3[get_input_tensor<br/>+ 像素拷贝]
-        F3 --> G4[infer 同步]
-        G4 --> H3[SSD 输出解析<br/>边界框+置信度]
-    end
-
-    subgraph hello_query_device
-        A --> Q1[get_available_devices]
-        Q1 --> Q2[get_property 遍历]
-    end
-
-    subgraph model_creation_sample
-        A --> M1[create_model<br/>opset13 编程建模]
-        M1 --> C
-    end
-```
-
 ---
 
 ## 4. 关键技术细节
@@ -1151,16 +721,16 @@ ov::Tensor input_tensor(ov::element::u8,
   |                                      |
 ```
 
-**线程安全关键点（来自 classification_sample_async）：**
+**线程安全关键点（异步推理通用模式）：**
 
 ```cpp
-// 文件: samples/cpp/classification_sample_async/main.cpp, 第 160-162 行
+// 异步推理的线程同步原语
 std::condition_variable condVar;
 std::mutex mutex;
 std::exception_ptr exception_var;  // 跨线程传递异常
 ```
 
-- `mutex` 保护 `cur_iteration`（迭代计数器）和 `exception_var`（异常指针）；
+- `mutex` 保护共享状态变量和 `exception_var`（异常指针）；
 - 回调函数使用 `std::lock_guard` 加锁后修改共享状态；
 - 主线程使用 `condVar.wait()` 配合谓词等待，避免虚假唤醒（spurious wakeup）。
 
@@ -1308,7 +878,7 @@ OpenVINO 采用宏封装的统一异常处理模式：
 **示例层异常处理（所有示例通用模式）：**
 
 ```cpp
-// 统一的异常捕获模式（hello_classification 第 120 行 / Real-ESRGAN 推理示例同理）
+// 统一的异常捕获模式（Real-ESRGAN 推理示例同理）
 } catch (const std::exception& ex) {
     std::cerr << ex.what() << std::endl;
     return EXIT_FAILURE;
@@ -1342,12 +912,13 @@ macro(ov_add_sample)
 endmacro()
 ```
 
-**使用示例（hello_classification/CMakeLists.txt）：**
+**使用示例（Real-ESRGAN 推理的 CMake 构建配置）：**
 
 ```cmake
-ov_add_sample(NAME hello_classification
+# 假设为 Real-ESRGAN 推理示例构建
+ov_add_sample(NAME real_esrgan_inference
               SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
-              DEPENDENCIES format_reader ie_samples_utils)
+              DEPENDENCIES opencv_core opencv_imgcodecs opencv_imgproc)
 ```
 
 **设计优势：**
@@ -1391,66 +962,65 @@ OpenVINO 将推理流程分为 `Core → Model → PrePostProcessor → Compiled
 
 ### 5.2 项目设计不足
 
-**1. 示例代码的异常处理过于简单**
+**1. 异常处理粒度不足**
 
-多数示例仅捕获 `std::exception` 并打印到 `stderr`，缺乏分类处理（如区分模型格式错误、设备不可用、内存不足等场景），不利于实际生产环境的错误诊断。
+Real-ESRGAN 推理示例中仅捕获 `std::exception` 并打印到 `stderr`，缺乏分类处理（如区分模型格式错误、设备不可用、内存不足等场景），不利于实际生产环境的错误诊断。
 
 **2. 编译时间较长**
 
 由于大量使用模板元编程（属性系统、类型安全张量访问），加之项目规模庞大（数百万行代码），完整编译耗时较长，增加开发迭代成本。
 
-**3. 部分示例的输入验证不够鲁棒**
+**3. 大尺寸图像推理的内存管理**
 
-例如 `hello_reshape_ssd` 中通过 `std::find_if` 遍历所有算子查找 `DetectionOutput` 层，时间复杂度 O(N)。虽然在模型规模不大时可接受，但缺乏更高效的层类型索引机制。
+Real-ESRGAN 等超分辨率模型处理大尺寸图像时，显存/内存消耗可能超出设备限制。OpenVINO 当前缺乏内置的分块推理（tiling）支持，需要用户在应用层手动实现分块、重叠和拼合逻辑。
 
 ### 5.3 核心逻辑可优化点
 
 **1. 预处理管线的运行时编译**
 
-当前 `PrePostProcessor::build()` 在每次调用时重新构建预处理子图。对于重复使用相同预处理配置的场景，可以缓存已构建的子图以避免重复开销。
+当前 `PrePostProcessor::build()` 在每次调用时重新构建预处理子图。对于 Real-ESRGAN 分块推理等重复使用相同预处理配置的场景，可以缓存已构建的子图以避免重复开销。
 
 **2. 异步推理的错误恢复**
 
-`classification_sample_async` 中异步推理链在异常发生时直接 `notify_all()` 退出，缺乏重试或降级机制。在生产环境中，可以增加：
-- 可配置的重试策略；
+异步推理链在异常发生时直接退出，缺乏重试或降级机制。在 Real-ESRGAN 生产部署中，可以增加：
+- 可配置的重试策略（如 ONNX opset 不兼容时自动降级）；
 - 异常计数与断路器模式；
 - 回退到同步推理的降级方案。
 
-**3. 批量推理的内存拷贝优化**
+**3. 分块推理的内存管理优化**
 
-在 `classification_sample_async` 和 `model_creation_sample` 中，批量数据通过 `std::memcpy` 逐图像拷贝到 batch 张量。对于大 batch size，可以考虑：
-- 使用内存映射（mmap）直接将图像文件映射到张量内存；
-- 利用异步 DMA 传输重叠计算和数据拷贝。
+Real-ESRGAN 处理大尺寸图像时需要分块推理，当前每个 tile 的输入/输出张量需要重新分配和拷贝。可以考虑：
+- 使用内存池预分配固定大小的 tile 缓冲区；
+- 利用 `model->reshape()` 动态调整输入尺寸以适配不同 tile 大小；
+- 通过异步推理重叠 tile 预处理和推理计算。
 
-### 5.4 Inference C++ Example 调用设计思路
+### 5.4 Real-ESRGAN 推理调用设计思路
 
-**渐进式学习路径设计：**
+**端到端推理管线设计：**
 
-示例按复杂度递进排列，形成清晰的学习路径：
+Real-ESRGAN 推理展示了 OpenVINO C++ API 在超分辨率场景下的典型使用模式：
 
 ```
-Real-ESRGAN 推理               →  超分辨率：同步推理 + 图像输入/输出 + 后处理
+图像读取 (OpenCV)  →  Core 初始化  →  ONNX 模型加载
   ↓
-hello_classification          →  最简推理：同步 + 单图分类
+PrePostProcessor 配置  →  u8→f32 + NHWC→NCHW + scale(÷255)
   ↓
-hello_query_device            →  设备管理：无推理，纯查询
+模型编译到设备  →  创建推理请求
   ↓
-hello_reshape_ssd             →  模型适配：动态 reshape + 目标检测后处理
+零拷贝输入张量  →  同步推理  →  输出张量获取
   ↓
-hello_nv12_input_classification →  特殊输入：NV12 色彩空间处理
-  ↓
-classification_sample_async   →  高级模式：异步推理 + 批处理 + 回调
-  ↓
-model_creation_sample         →  深度定制：编程式模型构建 + 权重管理
+后处理: 反归一化 + NCHW→NHWC + clamp  →  保存高分辨率图像
 ```
 
-**代码复用与模块化：**
+**关键设计决策：**
 
-所有示例共享 `common/` 工具库（`format_reader`、`slog`、`classification_results`），避免了代码重复。通过 `ov_add_sample()` 宏统一构建配置，降低了维护成本。
+1. **零拷贝输入**：直接包装 `cv::Mat` 内存作为 `ov::Tensor`，避免图像数据拷贝，在高分辨率场景下尤为重要；
+2. **PrePostProcessor 融合**：将归一化（`scale(255.0f)`）和布局转换（NHWC→NCHW）嵌入计算图，编译时可被优化器融合到后续计算中；
+3. **同步推理**：超分辨率任务通常单图处理且计算量大，同步模式简化了代码逻辑；异步模式可用于分块推理场景以重叠 I/O 和计算。
 
-**一致的代码结构：**
+**代码组织：**
 
-每个示例都遵循相同的代码模板：参数解析 → Core 初始化 → 模型加载 → 预处理 → 编译 → 推理 → 结果处理，配合编号注释（`// Step 1.`、`// Step 2.` 等），使读者可以在不同示例间快速定位对应步骤。
+Real-ESRGAN 推理代码遵循 OpenVINO 标准模板：参数解析 → Core 初始化 → 模型加载 → 预处理 → 编译 → 推理 → 结果处理，配合编号注释（`// Step 1.`、`// Step 2.` 等），便于读者快速定位各阶段代码。
 
 ---
 
@@ -1458,6 +1028,6 @@ model_creation_sample         →  深度定制：编程式模型构建 + 权重
 >
 > **基准版本**：基于 OpenVINO 源码仓库 commit `3de27668` 分析
 >
-> **分析范围**：Real-ESRGAN 超分辨率推理 + `samples/cpp/` 全部 6 个推理示例 + `src/inference/` 核心 API
+> **分析范围**：Real-ESRGAN 超分辨率推理 + `src/inference/` 核心 API
 >
 > **代码引用**：所有代码片段均标注了文件路径与行号，基于上述 commit 的实际源码。由于代码持续演进，行号可能在后续版本中发生偏移，建议结合函数名和上下文定位
