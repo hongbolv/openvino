@@ -169,6 +169,7 @@ ov::InferRequest infer_request = compiled_model.create_infer_request();
 // 推理执行阶段（可重复）— 对每张图像执行以下步骤
 // 以下操作可在图像序列中循环执行，无需重新加载或编译模型
 // ============================================================
+std::vector<std::string> image_list = {"input1.png", "input2.png"};  // 待处理图像列表
 for (const auto& image_path : image_list) {
     // 读取低分辨率图像（OpenCV）
     cv::Mat img = cv::imread(image_path, cv::IMREAD_COLOR);
